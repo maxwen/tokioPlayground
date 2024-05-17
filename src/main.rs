@@ -1,34 +1,73 @@
-use std::time::Duration;
+extern crate core;
 
-use tokio::sync::broadcast;
-use tokio::time::sleep;
+use std::io::Write;
+use std::num::NonZeroUsize;
+use std::sync::OnceLock;
 
-async fn task_loop_one(tx: broadcast::Sender<i32>) {
-    let mut count: i32 = 0;
-    loop {
-        println!("task_loop_one");
-        tx.send(count).unwrap();
-        count += 1;
-        sleep(Duration::from_millis(200)).await;
-    }
-}
+use futures_util::TryStreamExt;
+use once_cell::sync::Lazy;
+use stream_download::http::reqwest::Client;
+use stream_download::source::SourceStream;
+use tokio::sync::Mutex;
 
-async fn task_loop_two<'a>(mut rx: broadcast::Receiver<i32>) {
-    loop {
-        match rx.recv().await {
-            Ok(value) => {
-                println!("task_loop_two receiver {}", value);
-            }
-            Err(error) => { break; }
-        }
-    }
-}
+use crate::bounded::BoundedStorageProvider;
+use crate::memory::MemoryStorageProvider;
+use crate::source::{PositionReached, SourceHandle};
+use crate::storage::StorageProvider;
 
-async fn task_slow() {
-    println!("task_slow start");
-    sleep(Duration::from_millis(2000)).await;
-    println!("task_slow stop");
-}
+mod memory;
+mod source;
+mod storage;
+mod bounded;
+
+
+// async fn task_loop_one(tx: Arc<broadcast::Sender<i32>>) {
+//     let mut count: i32 = 0;
+//     loop {
+//         println!("task_loop_one");
+//         tx.send(count).unwrap();
+//         count += 1;
+//         sleep(Duration::from_millis(200)).await;
+//     }
+// }
+//
+// async fn task_loop_two(mut rx: broadcast::Receiver<i32>) {
+//     loop {
+//         match rx.recv().await {
+//             Ok(value) => {
+//                 println!("task_loop_two receiver {}", value);
+//             }
+//             Err(error) => { break; }
+//         }
+//     }
+// }
+// async fn task_loop_mutex_one(mut mutex: Arc<Mutex<i32>>) {
+//     loop {
+//         println!("task_loop_mutex_one before");
+//         let guard = mutex.lock().await;
+//         sleep(Duration::from_millis(200)).await;
+//         println!("task_loop_mutex_one after");
+//         drop(guard);
+//     }
+// }
+//
+// async fn task_loop_mutex_two(mut mutex: Arc<Mutex<i32>>) {
+//     loop {
+//         println!("task_loop_mutex_two before");
+//         let guard = mutex.lock().await;
+//         sleep(Duration::from_millis(2000)).await;
+//         println!("task_loop_mutex_two after");
+//         drop(guard);
+//     }
+// }
+//
+// async fn task_slow() {
+//     println!("task_slow start");
+//     sleep(Duration::from_millis(2000)).await;
+//     println!("task_slow stop");
+// }
+
+const STREAM_BUFFER_SIZE: usize = 1024 * 16;
 
 #[tokio::main]
 /*
@@ -41,26 +80,178 @@ async fn task_slow() {
         })
  */
 async fn main() {
-    println!("Hello, world!");
+    //
+    // let mutex = Arc::new(Mutex::new(0));
+    // tokio::spawn(task_loop_mutex_one(mutex.clone()));
+    // tokio::spawn(task_loop_mutex_two(mutex.clone()));
+    //
+    // let (_tx, rx) = broadcast::channel(16);
+    // let tx = Arc::new(_tx);
+    // tokio::spawn(task_loop_two(rx));
+    // tokio::spawn(task_loop_one(tx.clone()));
+    // //
+    // // let t = tokio::spawn(async move {
+    // //     task_slow().await
+    // // });
+    //
+    // let mut rx1 = tx.subscribe();
+    // loop {
+    //     sleep(Duration::from_millis(2000)).await;
+    //     match rx1.recv().await {
+    //         Ok(value) => {
+    //             println!("main receiver {}", value);
+    //         }
+    //         Err(error) => { break; }
+    //     }
+    // }
+    // // t.await.unwrap();
 
-    let (tx, rx) = broadcast::channel(16);
+    let working_url = "http://192.168.1.70:8001/stream";
 
-    tokio::spawn(task_loop_two(rx));
-    tokio::spawn(task_loop_one(tx.clone()));
+    let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
+    let sink = rodio::Sink::try_new(&handle).unwrap();
 
-    let t = tokio::spawn(async move {
-        task_slow().await
+    // let stream = HttpStream::<Client>::create(working_url.parse().unwrap()).await.unwrap();
+    //
+    // println!("content type={:?}", stream.content_type());
+    // let bitrate: u64 = stream.header("Icy-Br").unwrap().parse().unwrap();
+    // println!("bitrate={bitrate}");
+    //
+    // // buffer 5 seconds of audio
+    // // bitrate (in kilobits) / bits per byte * bytes per kilobyte * 5 seconds
+    // let prefetch_bytes = bitrate / 8 * 1024 * 5;
+    // println!("prefetch bytes={prefetch_bytes}");
+    //
+    // let reader =
+    //     StreamDownload::from_stream(stream, BoundedStorageProvider::new(
+    //         MemoryStorageProvider,
+    //         // be liberal with the buffer size, you need to make sure it holds enough space to
+    //         // prevent any out-of-bounds reads
+    //         NonZeroUsize::new(128 * 1024).unwrap(),
+    //     )/*TempStorageProvider::new()*/, Settings::default().prefetch_bytes(prefetch_bytes))
+    //         .await.unwrap();
+    //
+    // sink.append(rodio::Decoder::new_mp3(reader).unwrap());
+    //
+    // let handle = tokio::task::spawn_blocking(move || {
+    //     sink.sleep_until_end();
+    // });
+    // handle.await.unwrap();
+
+    // blatant kang and simplified from stream-download for learning purposes how
+    // to create a streaming source for rodio
+    // stripped down to bounded memory only
+    let storage_provider = BoundedStorageProvider::new(
+        MemoryStorageProvider::new(),
+        NonZeroUsize::new(128 * 1024).unwrap());
+    let (reader, mut writer) = storage_provider.into_reader_writer(None).unwrap();
+
+    let j = tokio::spawn(async move {
+        let client = Client::new();
+        let mut data_buffer = Vec::new();
+        let mut data_buffer_index = 0;
+
+        let mut response = match client.get(working_url).header("icy-metadata", "1").send().await {
+            Ok(t) => t,
+            Err(_) => {
+                return;
+            }
+        };
+        if let Some(header_value) = response.headers().get("content-type") {
+            if header_value.to_str().unwrap_or_default() != "audio/mpeg" {
+                return;
+            }
+        } else {
+            return;
+        }
+        let meta_interval: usize = if let Some(header_value) = response.headers().get("icy-metaint") {
+            header_value.to_str().unwrap_or_default().parse().unwrap_or_default()
+        } else {
+            0
+        };
+        println!("meta_interval={meta_interval}");
+
+        let bitrate: usize = if let Some(header_value) = response.headers().get("Icy-Br") {
+            header_value.to_str().unwrap_or_default().parse().unwrap_or_default()
+        } else {
+            0
+        };
+        println!("bitrate={bitrate}");
+
+        // buffer 5 seconds of audio
+        // bitrate (in kilobits) / bits per byte * bytes per kilobyte * 5 seconds
+        let prefetch_bytes = bitrate / 8 * 1024 * 5;
+        println!("prefetch bytes={prefetch_bytes}");
+
+        let mut counter = meta_interval;
+        let mut awaiting_metadata_size = false;
+        let mut metadata_size: u8 = 0;
+        let mut awaiting_metadata = false;
+        let mut metadata: Vec<u8> = Vec::new();
+
+        let mut http_stream = response.bytes_stream();
+        while let Some(chunk) = http_stream.try_next().await.unwrap() {
+            for byte in &chunk {
+                if meta_interval != 0 {
+                    if awaiting_metadata_size {
+                        awaiting_metadata_size = false;
+                        metadata_size = *byte * 16;
+                        if metadata_size == 0 {
+                            counter = meta_interval;
+                        } else {
+                            awaiting_metadata = true;
+                        }
+                    } else if awaiting_metadata {
+                        metadata.push(*byte);
+                        metadata_size = metadata_size.saturating_sub(1);
+                        if metadata_size == 0 {
+                            awaiting_metadata = false;
+                            let metadata_string = std::str::from_utf8(&metadata).unwrap_or("");
+                            if !metadata_string.is_empty() {
+                                const STREAM_TITLE_KEYWORD: &str = "StreamTitle='";
+                                if let Some(index) = metadata_string.find(STREAM_TITLE_KEYWORD) {
+                                    let left_index = index + 13;
+                                    let stream_title_substring = &metadata_string[left_index..];
+                                    if let Some(right_index) = stream_title_substring.find('\'') {
+                                        let trimmed_song_title = &stream_title_substring[..right_index];
+                                        println!("Current Song: {}", trimmed_song_title);
+                                    }
+                                }
+                            }
+                            metadata.clear();
+                            counter = meta_interval;
+                        }
+                    } else {
+                        data_buffer.push(*byte);
+                        data_buffer_index += 1;
+
+                        if data_buffer_index >= STREAM_BUFFER_SIZE {
+                            writer.write(data_buffer.as_slice()).unwrap();
+
+                            writer.inner.handle.position_reached.notify_position_reached();
+
+                            data_buffer_index = 0;
+                            data_buffer.clear();
+                        }
+                        counter = counter.saturating_sub(1);
+                        if counter == 0 {
+                            awaiting_metadata_size = true;
+                        }
+                    }
+                } else {
+                    data_buffer.push(*byte);
+                    data_buffer_index += 1;
+                }
+            }
+        }
     });
 
-    let mut rx1 = tx.subscribe();
-    loop {
-        // sleep(Duration::from_millis(2000)).await;
-        match rx1.recv().await {
-            Ok(value) => {
-                println!("main receiver {}", value);
-            }
-            Err(error) => { break; }
-        }
-    }
-    t.await.unwrap();
+    reader.inner.handle.wait_for_requested_position();
+
+    sink.append(rodio::Decoder::new_mp3(reader).unwrap());
+
+    let handle = tokio::task::spawn_blocking(move || {
+        sink.sleep_until_end();
+    });
+    j.await.unwrap();
 }
