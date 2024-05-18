@@ -2,23 +2,28 @@ extern crate core;
 
 use std::io::Write;
 use std::num::NonZeroUsize;
-use std::sync::OnceLock;
+use std::process::exit;
+use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::TryStreamExt;
-use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use rodio::Source;
+use serde::{Deserialize, Serialize};
 use stream_download::http::reqwest::Client;
 use stream_download::source::SourceStream;
-use tokio::sync::Mutex;
+use tokio::time::sleep;
 
 use crate::bounded::BoundedStorageProvider;
 use crate::memory::MemoryStorageProvider;
-use crate::source::{PositionReached, SourceHandle};
+use crate::spy_decoder::SpyDecoder;
 use crate::storage::StorageProvider;
 
 mod memory;
 mod source;
 mod storage;
 mod bounded;
+mod spy_decoder;
 
 
 // async fn task_loop_one(tx: Arc<broadcast::Sender<i32>>) {
@@ -68,6 +73,51 @@ mod bounded;
 // }
 
 const STREAM_BUFFER_SIZE: usize = 1024 * 16;
+const MEMORY_BUFFER_SIZE: usize = 1024 * 512;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RadioStation {
+    url: String,
+    title: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RadioStationList {
+    list: Vec<RadioStation>,
+}
+
+impl RadioStation {
+    fn new(title: &str, url: &str) -> Self {
+        RadioStation {
+            url: String::from(url),
+            title: String::from(title),
+        }
+    }
+}
+
+impl RadioStationList {
+    fn add(&mut self, station: RadioStation) {
+        self.list.push(station);
+    }
+
+    fn get(self, name: &str) -> Option<RadioStation> {
+        if let Some(station) = self.list.iter().find(|station| station.title == name) {
+            return Some(station.clone());
+        }
+        None
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MetaData {
+    title: String,
+}
+
+impl MetaData {
+    fn new() -> Self {
+        MetaData { title: "".to_string() }
+    }
+}
 
 #[tokio::main]
 /*
@@ -106,7 +156,26 @@ async fn main() {
     // }
     // // t.await.unwrap();
 
-    let working_url = "http://192.168.1.70:8001/stream";
+
+    let mut working_url = "".to_string();
+    let mut station_list = RadioStationList { list: vec![] };
+    station_list.add(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
+    station_list.add(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
+    station_list.add(RadioStation::new("Terry Callaghan's Classic Alternative Channel", "http://s16.myradiostream.com:7304"));
+    station_list.add(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
+    station_list.add(RadioStation::new("local", "http://192.168.1.70:8001/stream"));
+
+    if let Some(station) = station_list.get("local") {
+        working_url = station.url.to_string();
+    } else {
+        println!("no station match");
+        exit(-1);
+    }
+
+    println!("working_url {}", working_url);
+
+    let current_metadata = Arc::new(RwLock::new(MetaData::new()));
+    let current_metadata_write = current_metadata.clone();
 
     let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
     let sink = rodio::Sink::try_new(&handle).unwrap();
@@ -143,10 +212,10 @@ async fn main() {
     // stripped down to bounded memory only
     let storage_provider = BoundedStorageProvider::new(
         MemoryStorageProvider::new(),
-        NonZeroUsize::new(128 * 1024).unwrap());
+        NonZeroUsize::new(MEMORY_BUFFER_SIZE).unwrap());
     let (reader, mut writer) = storage_provider.into_reader_writer(None).unwrap();
 
-    let j = tokio::spawn(async move {
+    let stream_task = tokio::spawn(async move {
         let client = Client::new();
         let mut data_buffer = Vec::new();
         let mut data_buffer_index = 0;
@@ -164,6 +233,10 @@ async fn main() {
         } else {
             return;
         }
+        for header in response.headers().iter() {
+            if header.0.to_string().starts_with("icy") { println!("{} {}", header.0, header.1.to_str().unwrap_or_default().parse::<String>().unwrap_or_default()) }
+        }
+
         let meta_interval: usize = if let Some(header_value) = response.headers().get("icy-metaint") {
             header_value.to_str().unwrap_or_default().parse().unwrap_or_default()
         } else {
@@ -187,7 +260,7 @@ async fn main() {
         let mut awaiting_metadata_size = false;
         let mut metadata_size: u8 = 0;
         let mut awaiting_metadata = false;
-        let mut metadata: Vec<u8> = Vec::new();
+        let mut metadata: Vec<u8> = Vec::with_capacity(STREAM_BUFFER_SIZE);
 
         let mut http_stream = response.bytes_stream();
         while let Some(chunk) = http_stream.try_next().await.unwrap() {
@@ -214,7 +287,7 @@ async fn main() {
                                     let stream_title_substring = &metadata_string[left_index..];
                                     if let Some(right_index) = stream_title_substring.find('\'') {
                                         let trimmed_song_title = &stream_title_substring[..right_index];
-                                        println!("Current Song: {}", trimmed_song_title);
+                                        current_metadata_write.write().title = trimmed_song_title.to_string();
                                     }
                                 }
                             }
@@ -227,9 +300,7 @@ async fn main() {
 
                         if data_buffer_index >= STREAM_BUFFER_SIZE {
                             writer.write(data_buffer.as_slice()).unwrap();
-
                             writer.inner.handle.position_reached.notify_position_reached();
-
                             data_buffer_index = 0;
                             data_buffer.clear();
                         }
@@ -241,17 +312,35 @@ async fn main() {
                 } else {
                     data_buffer.push(*byte);
                     data_buffer_index += 1;
+
+                    if data_buffer_index >= STREAM_BUFFER_SIZE {
+                        writer.write(data_buffer.as_slice()).unwrap();
+                        writer.inner.handle.position_reached.notify_position_reached();
+                        data_buffer_index = 0;
+                        data_buffer.clear();
+                    }
                 }
             }
         }
     });
 
-    reader.inner.handle.wait_for_requested_position();
+    let play_task = tokio::spawn(async move {
+        reader.inner.handle.wait_for_requested_position();
 
-    sink.append(rodio::Decoder::new_mp3(reader).unwrap());
+        let decoder = SpyDecoder::new(reader).unwrap();
+        sink.append(decoder);
 
-    let handle = tokio::task::spawn_blocking(move || {
-        sink.sleep_until_end();
+        let handle = tokio::task::spawn_blocking(move || {
+            sink.sleep_until_end();
+        });
     });
-    j.await.unwrap();
+
+    let status_task = tokio::spawn(async move {
+        loop {
+            println!("Now playing: {}", current_metadata.read().title);
+            sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    stream_task.await.unwrap();
 }

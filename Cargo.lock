@@ -1583,6 +1583,7 @@ dependencies = [
  "parking_lot",
  "reqwest",
  "rodio",
+ "serde",
  "stream-download",
  "symphonia",
  "tokio",
