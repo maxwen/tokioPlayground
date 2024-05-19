@@ -33,7 +33,7 @@ impl PositionReached {
         cvar.notify_all();
     }
 
-    fn notify_stream_done(&self) {
+    pub(crate) fn notify_stream_done(&self) {
         let (mutex, cvar) = self.0.as_ref();
         mutex.lock().stream_done = true;
         cvar.notify_all();

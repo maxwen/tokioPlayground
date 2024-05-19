@@ -3,8 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::RwLock;
-
-use crate::source::{PositionReached, SourceHandle};
 use crate::storage::StorageProvider;
 
 #[derive(Default, Clone, Debug)]
@@ -29,29 +27,17 @@ impl StorageProvider for MemoryStorageProvider {
             .try_into()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e)).unwrap();
 
-        let position_reached = PositionReached::default();
-
-        let write_handle = SourceHandle {
-            position_reached: position_reached.clone(),
-        };
-
-        let read_handle = SourceHandle {
-            position_reached: position_reached.clone(),
-        };
-
         let inner = Arc::new(RwLock::new(vec![0; initial_buffer_size]));
         let written = Arc::new(AtomicUsize::new(0));
         let reader = MemoryStorage {
             inner: inner.clone(),
             position: 0,
             written: written.clone(),
-            handle: read_handle,
         };
         let writer = MemoryStorage {
             inner,
             position: 0,
             written,
-            handle: write_handle,
         };
         Ok((reader, writer))
     }
@@ -63,7 +49,6 @@ pub struct MemoryStorage {
     pub(crate) inner: Arc<RwLock<Vec<u8>>>,
     pub(crate) position: usize,
     pub(crate) written: Arc<AtomicUsize>,
-    pub(crate) handle: SourceHandle,
 }
 
 impl MemoryStorage {}

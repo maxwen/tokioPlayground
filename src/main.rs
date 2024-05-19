@@ -1,29 +1,30 @@
-extern crate core;
-
-use std::io::Write;
+use std::cmp::PartialEq;
+use std::io::{Read, Seek, Write};
 use std::num::NonZeroUsize;
-use std::process::exit;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures_util::TryStreamExt;
 use parking_lot::RwLock;
-use rodio::Source;
+use rand::Rng;
+use rodio::{Decoder, Sink, Source};
 use serde::{Deserialize, Serialize};
-use stream_download::http::reqwest::Client;
 use stream_download::source::SourceStream;
-use tokio::time::sleep;
+use symphonia::core::meta::MetadataRevision;
+use tokio::io::AsyncReadExt;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::bounded::BoundedStorageProvider;
 use crate::memory::MemoryStorageProvider;
-use crate::spy_decoder::SpyDecoder;
-use crate::storage::StorageProvider;
+use crate::stream::StreamDownload;
 
 mod memory;
 mod source;
-mod storage;
+mod stream;
 mod bounded;
 mod spy_decoder;
+mod storage;
 
 
 // async fn task_loop_one(tx: Arc<broadcast::Sender<i32>>) {
@@ -72,8 +73,7 @@ mod spy_decoder;
 //     println!("task_slow stop");
 // }
 
-const STREAM_BUFFER_SIZE: usize = 1024 * 16;
-const MEMORY_BUFFER_SIZE: usize = 1024 * 512;
+const MEMORY_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RadioStation {
@@ -106,6 +106,13 @@ impl RadioStationList {
         }
         None
     }
+
+    fn get_random(self) -> Option<RadioStation> {
+        if self.list.len() != 0 {
+            return Some(self.list[rand::thread_rng().gen_range(0..self.list.len())].clone());
+        }
+        None
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -114,50 +121,92 @@ struct MetaData {
 }
 
 impl MetaData {
-    fn new() -> Self {
-        MetaData { title: "".to_string() }
+    fn new(title: &str) -> Self {
+        MetaData { title: title.to_string() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Action {
+    Start,
+    Pause,
+    Resume,
+    Quit,
+}
+
+#[derive(Clone, Debug)]
+struct Command {
+    action: Action,
+    station: Option<RadioStation>,
+}
+
+impl Command {
+    pub fn new_start(station: RadioStation) -> Command {
+        Command {
+            action: Action::Start,
+            station: Some(station.clone()),
+        }
+    }
+    pub fn new_pause() -> Command {
+        Command {
+            action: Action::Pause,
+            station: None,
+        }
+    }
+
+    pub fn new_resume() -> Command {
+        Command {
+            action: Action::Resume,
+            station: None,
+        }
+    }
+
+    pub fn new_quit() -> Command {
+        Command {
+            action: Action::Quit,
+            station: None,
+        }
+    }
+}
+
+async fn play_station(station: RadioStation, sink: Arc<Sink>, command_channel_rx: Receiver<Command>, meta_channel_tx: Sender<MetaData>) {
+    let storage_provider = BoundedStorageProvider::new(
+        MemoryStorageProvider::new(),
+        NonZeroUsize::new(MEMORY_BUFFER_SIZE).unwrap());
+    match StreamDownload::new(station.url, storage_provider, command_channel_rx, meta_channel_tx).await {
+        Ok(stream_download) => {
+            let play_sink = sink.clone();
+            play_sink.play();
+
+            tokio::task::spawn(async move {
+                println!("play_task ready");
+                match Decoder::new(stream_download) {
+                    Ok(decoder) => {
+                        play_sink.append(decoder);
+                    }
+                    Err(_) => {}
+                }
+
+                let handle = tokio::task::spawn_blocking(move || {
+                    play_sink.sleep_until_end();
+                });
+                handle.await.unwrap();
+            });
+        }
+        Err(e) => {
+            println!("create stream failed {}", e)
+        }
     }
 }
 
 #[tokio::main]
-/*
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(async {
-            main() ...
-        })
- */
 async fn main() {
-    //
-    // let mutex = Arc::new(Mutex::new(0));
-    // tokio::spawn(task_loop_mutex_one(mutex.clone()));
-    // tokio::spawn(task_loop_mutex_two(mutex.clone()));
-    //
-    // let (_tx, rx) = broadcast::channel(16);
-    // let tx = Arc::new(_tx);
-    // tokio::spawn(task_loop_two(rx));
-    // tokio::spawn(task_loop_one(tx.clone()));
-    // //
-    // // let t = tokio::spawn(async move {
-    // //     task_slow().await
-    // // });
-    //
-    // let mut rx1 = tx.subscribe();
-    // loop {
-    //     sleep(Duration::from_millis(2000)).await;
-    //     match rx1.recv().await {
-    //         Ok(value) => {
-    //             println!("main receiver {}", value);
-    //         }
-    //         Err(error) => { break; }
-    //     }
-    // }
-    // // t.await.unwrap();
+    let (command_channel_tx, mut command_channel_rx) = broadcast::channel::<Command>(1);
+    let (meta_channel_tx, mut meta_channel_rx) = broadcast::channel::<MetaData>(1);
 
+    let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
+    let sink = Arc::new(rodio::Sink::try_new(&handle).unwrap());
 
-    let mut working_url = "".to_string();
     let mut station_list = RadioStationList { list: vec![] };
     station_list.add(RadioStation::new("FM4", "http://orf-live.ors-shoutcast.at/fm4-q2a"));
     station_list.add(RadioStation::new("MetalRock.FM", "http://cheetah.streemlion.com:2160/stream"));
@@ -165,182 +214,43 @@ async fn main() {
     station_list.add(RadioStation::new("OE3", "http://orf-live.ors-shoutcast.at/oe3-q2a"));
     station_list.add(RadioStation::new("local", "http://192.168.1.70:8001/stream"));
 
-    if let Some(station) = station_list.get("local") {
-        working_url = station.url.to_string();
-    } else {
-        println!("no station match");
-        exit(-1);
-    }
-
-    println!("working_url {}", working_url);
-
-    let current_metadata = Arc::new(RwLock::new(MetaData::new()));
-    let current_metadata_write = current_metadata.clone();
-
-    let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
-    let sink = rodio::Sink::try_new(&handle).unwrap();
-
-    // let stream = HttpStream::<Client>::create(working_url.parse().unwrap()).await.unwrap();
-    //
-    // println!("content type={:?}", stream.content_type());
-    // let bitrate: u64 = stream.header("Icy-Br").unwrap().parse().unwrap();
-    // println!("bitrate={bitrate}");
-    //
-    // // buffer 5 seconds of audio
-    // // bitrate (in kilobits) / bits per byte * bytes per kilobyte * 5 seconds
-    // let prefetch_bytes = bitrate / 8 * 1024 * 5;
-    // println!("prefetch bytes={prefetch_bytes}");
-    //
-    // let reader =
-    //     StreamDownload::from_stream(stream, BoundedStorageProvider::new(
-    //         MemoryStorageProvider,
-    //         // be liberal with the buffer size, you need to make sure it holds enough space to
-    //         // prevent any out-of-bounds reads
-    //         NonZeroUsize::new(128 * 1024).unwrap(),
-    //     )/*TempStorageProvider::new()*/, Settings::default().prefetch_bytes(prefetch_bytes))
-    //         .await.unwrap();
-    //
-    // sink.append(rodio::Decoder::new_mp3(reader).unwrap());
-    //
-    // let handle = tokio::task::spawn_blocking(move || {
-    //     sink.sleep_until_end();
-    // });
-    // handle.await.unwrap();
-
-    // blatant kang and simplified from stream-download for learning purposes how
-    // to create a streaming source for rodio
-    // stripped down to bounded memory only
-    let storage_provider = BoundedStorageProvider::new(
-        MemoryStorageProvider::new(),
-        NonZeroUsize::new(MEMORY_BUFFER_SIZE).unwrap());
-    let (reader, mut writer) = storage_provider.into_reader_writer(None).unwrap();
-
-    let stream_task = tokio::spawn(async move {
-        let client = Client::new();
-        let mut data_buffer = Vec::new();
-        let mut data_buffer_index = 0;
-
-        let mut response = match client.get(working_url).header("icy-metadata", "1").send().await {
-            Ok(t) => t,
-            Err(_) => {
-                return;
-            }
-        };
-        if let Some(header_value) = response.headers().get("content-type") {
-            if header_value.to_str().unwrap_or_default() != "audio/mpeg" {
-                return;
-            }
-        } else {
-            return;
-        }
-        for header in response.headers().iter() {
-            if header.0.to_string().starts_with("icy") { println!("{} {}", header.0, header.1.to_str().unwrap_or_default().parse::<String>().unwrap_or_default()) }
-        }
-
-        let meta_interval: usize = if let Some(header_value) = response.headers().get("icy-metaint") {
-            header_value.to_str().unwrap_or_default().parse().unwrap_or_default()
-        } else {
-            0
-        };
-        println!("meta_interval={meta_interval}");
-
-        let bitrate: usize = if let Some(header_value) = response.headers().get("Icy-Br") {
-            header_value.to_str().unwrap_or_default().parse().unwrap_or_default()
-        } else {
-            0
-        };
-        println!("bitrate={bitrate}");
-
-        // buffer 5 seconds of audio
-        // bitrate (in kilobits) / bits per byte * bytes per kilobyte * 5 seconds
-        let prefetch_bytes = bitrate / 8 * 1024 * 5;
-        println!("prefetch bytes={prefetch_bytes}");
-
-        let mut counter = meta_interval;
-        let mut awaiting_metadata_size = false;
-        let mut metadata_size: u8 = 0;
-        let mut awaiting_metadata = false;
-        let mut metadata: Vec<u8> = Vec::with_capacity(STREAM_BUFFER_SIZE);
-
-        let mut http_stream = response.bytes_stream();
-        while let Some(chunk) = http_stream.try_next().await.unwrap() {
-            for byte in &chunk {
-                if meta_interval != 0 {
-                    if awaiting_metadata_size {
-                        awaiting_metadata_size = false;
-                        metadata_size = *byte * 16;
-                        if metadata_size == 0 {
-                            counter = meta_interval;
-                        } else {
-                            awaiting_metadata = true;
-                        }
-                    } else if awaiting_metadata {
-                        metadata.push(*byte);
-                        metadata_size = metadata_size.saturating_sub(1);
-                        if metadata_size == 0 {
-                            awaiting_metadata = false;
-                            let metadata_string = std::str::from_utf8(&metadata).unwrap_or("");
-                            if !metadata_string.is_empty() {
-                                const STREAM_TITLE_KEYWORD: &str = "StreamTitle='";
-                                if let Some(index) = metadata_string.find(STREAM_TITLE_KEYWORD) {
-                                    let left_index = index + 13;
-                                    let stream_title_substring = &metadata_string[left_index..];
-                                    if let Some(right_index) = stream_title_substring.find('\'') {
-                                        let trimmed_song_title = &stream_title_substring[..right_index];
-                                        current_metadata_write.write().title = trimmed_song_title.to_string();
-                                    }
-                                }
-                            }
-                            metadata.clear();
-                            counter = meta_interval;
-                        }
-                    } else {
-                        data_buffer.push(*byte);
-                        data_buffer_index += 1;
-
-                        if data_buffer_index >= STREAM_BUFFER_SIZE {
-                            writer.write(data_buffer.as_slice()).unwrap();
-                            writer.inner.handle.position_reached.notify_position_reached();
-                            data_buffer_index = 0;
-                            data_buffer.clear();
-                        }
-                        counter = counter.saturating_sub(1);
-                        if counter == 0 {
-                            awaiting_metadata_size = true;
-                        }
-                    }
-                } else {
-                    data_buffer.push(*byte);
-                    data_buffer_index += 1;
-
-                    if data_buffer_index >= STREAM_BUFFER_SIZE {
-                        writer.write(data_buffer.as_slice()).unwrap();
-                        writer.inner.handle.position_reached.notify_position_reached();
-                        data_buffer_index = 0;
-                        data_buffer.clear();
-                    }
-                }
-            }
-        }
-    });
-
-    let play_task = tokio::spawn(async move {
-        reader.inner.handle.wait_for_requested_position();
-
-        let decoder = SpyDecoder::new(reader).unwrap();
-        sink.append(decoder);
-
-        let handle = tokio::task::spawn_blocking(move || {
-            sink.sleep_until_end();
-        });
-    });
-
-    let status_task = tokio::spawn(async move {
+    tokio::task::spawn(async move {
         loop {
-            println!("Now playing: {}", current_metadata.read().title);
-            sleep(Duration::from_secs(5)).await;
+            match meta_channel_rx.recv().await {
+                Ok(meta) => {println!("now playing {}", meta.title)}
+                Err(_) => {}
+            }
         }
     });
 
-    stream_task.await.unwrap();
+    let command_sink = sink.clone();
+    loop {
+        let mut buf = String::new();
+        std::io::stdin().read_line(&mut buf).unwrap();
+        let c = buf.chars().nth(0).unwrap();
+        match c {
+            's' => {
+                // stop download
+                let command = Command::new_quit();
+                let _ = command_channel_tx.send(command);
+                // stop play task
+                command_sink.clear();
+                play_station(station_list.clone().get_random().unwrap(), sink.clone(), command_channel_tx.subscribe(), meta_channel_tx.clone()).await;
+            }
+            'p' => {
+                // TODO
+                command_sink.pause();
+            }
+            'r' => {
+                // TODO
+                command_sink.play();
+            }
+            'q' => {
+                let command = Command::new_quit();
+                let _ = command_channel_tx.send(command);
+                break;
+            }
+            _ => {}
+        }
+    }
 }
