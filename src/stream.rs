@@ -8,7 +8,7 @@ use reqwest::{Client, Url};
 use stream_download::http::ClientResponse;
 use tokio::sync::broadcast::{Receiver, Sender};
 
-use crate::{Command, MetaData};
+use crate::{Action, MetaData};
 use crate::source::{PositionReached, SourceHandle};
 use crate::storage::{StorageProvider, StorageWriter};
 
@@ -20,7 +20,7 @@ pub struct StreamDownload<P: StorageProvider> {
 }
 
 #[derive(Debug, Clone)]
-struct StreamError {
+pub struct StreamError {
     msg: String,
 }
 
@@ -41,8 +41,11 @@ impl fmt::Display for StreamError {
 }
 
 impl<P: StorageProvider> StreamDownload<P> {
-    pub async fn new(working_url: &str, storage_provider: P, mut command_channel_rx: Receiver<Command>,
-                     meta_channel_tx: Sender<MetaData>) -> Result<Self, Box<dyn Error>> {
+    // with and without anyhow
+    // anyhow::Result<Self>
+    // Result<Self, Box<dyn Error>>
+    pub async fn new(working_url: &str, storage_provider: P, mut command_channel_rx: Receiver<Action>,
+                     meta_channel_tx: Sender<MetaData>) -> anyhow::Result<Self> {
         let (reader, mut writer) = storage_provider.into_reader_writer(None)?;
 
         let client = Client::new();
@@ -96,9 +99,9 @@ impl<P: StorageProvider> StreamDownload<P> {
             'outer: loop {
                 if let Ok(chunk) = stream.next().await.transpose() {
                     if !command_channel_rx.is_empty() {
-                        if let Ok(command) = command_channel_rx.recv().await {
+                        if let Ok(action) = command_channel_rx.recv().await {
                             // println!("received {:?}", command);
-                            match command.action {
+                            match action {
                                 _ => { break 'outer; }
                             }
                         }

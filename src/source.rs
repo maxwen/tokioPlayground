@@ -7,7 +7,6 @@ use tokio::sync::mpsc::error::TrySendError;
 #[derive(Default, Debug)]
 struct Waiter {
     position_reached: bool,
-    stream_done: bool,
 }
 
 
@@ -33,26 +32,12 @@ impl PositionReached {
         cvar.notify_all();
     }
 
-    pub(crate) fn notify_stream_done(&self) {
-        let (mutex, cvar) = self.0.as_ref();
-        mutex.lock().stream_done = true;
-        cvar.notify_all();
-    }
-
     fn wait_for_position_reached(&self) {
         let (mutex, cvar) = self.0.as_ref();
         let mut waiter = mutex.lock();
-        if waiter.stream_done {
-            return;
-        }
-
 
         cvar.wait_while(&mut waiter, |waiter| {
-            !waiter.stream_done && !waiter.position_reached
+            !waiter.position_reached
         });
-
-        if !waiter.stream_done {
-            waiter.position_reached = false;
-        }
     }
 }

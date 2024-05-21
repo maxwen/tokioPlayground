@@ -1,7 +1,8 @@
 extern crate core;
 
-use std::cmp::{max, min, PartialEq};
+use std::cmp::{min, PartialEq};
 use std::error::Error;
+use std::fmt::{Debug, Display};
 use std::io::{Read, Seek, stdout, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use ratatui::{Frame, Terminal};
 use ratatui::prelude::{Backend, Color, Constraint, CrosstermBackend, Direction, Layout, Rect, Span, Style, Stylize, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use rodio::{Decoder, Sink, Source};
+use rodio::decoder::DecoderError;
 use serde::{Deserialize, Serialize};
 use stream_download::source::SourceStream;
 use symphonia::core::conv::IntoSample;
@@ -83,7 +85,7 @@ impl RadioStationList {
     }
 
     fn get_at_index(&self, index: usize) -> Option<RadioStation> {
-        if index >= 0 && index < self.list.len() {
+        if index < self.list.len() {
             return Some(self.list[index].clone());
         }
         None
@@ -120,60 +122,28 @@ enum Action {
     Quit,
 }
 
-#[derive(Clone, Debug)]
-struct Command {
-    action: Action,
-    station: Option<RadioStation>,
-}
-
-impl Command {
-    pub fn new_start(station: RadioStation) -> Command {
-        Command {
-            action: Action::Start,
-            station: Some(station.clone()),
-        }
-    }
-    pub fn new_pause() -> Command {
-        Command {
-            action: Action::Pause,
-            station: None,
-        }
-    }
-
-    pub fn new_resume() -> Command {
-        Command {
-            action: Action::Resume,
-            station: None,
-        }
-    }
-
-    pub fn new_quit() -> Command {
-        Command {
-            action: Action::Quit,
-            station: None,
-        }
+impl Action {
+    pub fn new_quit() -> Self {
+        Self::Quit
     }
 }
 
-async fn play_station(station: RadioStation, sink: Arc<Sink>, command_channel_rx: Receiver<Command>, meta_channel_tx: Sender<MetaData>) -> Result<(), Box<dyn Error>> {
+async fn play_station(station: RadioStation, sink: Arc<Sink>, command_channel_rx: Receiver<Action>, meta_channel_tx: Sender<MetaData>) -> anyhow::Result<()> {
     let storage_provider = BoundedStorageProvider::new(
         MemoryStorageProvider::new(),
         NonZeroUsize::new(MEMORY_BUFFER_SIZE).unwrap());
     let stream_download = StreamDownload::new(station.url(), storage_provider, command_channel_rx, meta_channel_tx).await?;
 
-    let play_sink = sink.clone();
-    play_sink.play();
-
     let handle = tokio::task::spawn_blocking(move || {
-        match Decoder::new(stream_download) {
-            Ok(decoder) => {
-                play_sink.append(decoder);
-            }
-            Err(_) => {}
-        }
+        let decoder = Decoder::new(stream_download)?;
+        sink.append(decoder);
+        Ok::<(), DecoderError>(())
     });
-    handle.await?;
-    Ok(())
+    match handle.await {
+        Ok(Ok(())) => { Ok(()) }
+        Ok(Err(e)) => { Err(anyhow::anyhow!(e)) }
+        Err(e) => { Err(anyhow::anyhow!(e)) }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -325,7 +295,7 @@ fn draw_status(
 
 #[tokio::main]
 async fn main() {
-    let (command_channel_tx, mut command_channel_rx) = broadcast::channel::<Command>(1);
+    let (command_channel_tx, mut command_channel_rx) = broadcast::channel::<Action>(1);
     let (meta_channel_tx, mut meta_channel_rx) = broadcast::channel::<MetaData>(1);
 
     let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
@@ -370,48 +340,33 @@ async fn main() {
                         KeyCode::Down => {
                             app.set_next_station();
                         }
-                        KeyCode::Char('s') => {
+                        KeyCode::Char('s') | KeyCode::Char('r') | KeyCode::Enter => {
                             // stop download
-                            let command = Command::new_quit();
-                            let _ = command_channel_tx.send(command);
+                            let action = Action::new_quit();
+                            let _ = command_channel_tx.send(action);
                             // stop play task
                             command_sink.stop();
                             // start new
-                            // app.set_random_station();
                             match play_station(app.current_station().unwrap(), sink.clone(), command_channel_tx.subscribe(), meta_channel_tx.clone()).await {
                                 Ok(_) => {
                                     app.set_current_status(None);
                                 }
                                 Err(e) => {
-                                    app.set_current_status(Some(format!("create stream failed {}", e)));
+                                    app.set_current_status(Some(format!("Create stream failed {}", e)));
                                 }
                             }
                         }
                         KeyCode::Char('p') => {
-                            let command = Command::new_quit();
-                            let _ = command_channel_tx.send(command);
+                            let action = Action::new_quit();
+                            let _ = command_channel_tx.send(action);
                             // stop play task
                             command_sink.stop();
-                        }
-                        KeyCode::Char('r') => {
-                            let command = Command::new_quit();
-                            let _ = command_channel_tx.send(command);
-                            // stop play task
-                            command_sink.stop();
-                            // restart current
-                            match play_station(app.current_station().unwrap(), sink.clone(), command_channel_tx.subscribe(), meta_channel_tx.clone()).await {
-                                Ok(_) => {
-                                    app.set_current_status(None);
-                                }
-                                Err(e) => {
-                                    app.set_current_status(Some(format!("create stream failed {}", e)));
-                                }
-                            }
+                            app.set_current_status(Some("Paused".to_string()));
                         }
                         KeyCode::Char('q') => {
                             command_sink.stop();
-                            let command = Command::new_quit();
-                            let _ = command_channel_tx.send(command);
+                            let action = Action::new_quit();
+                            let _ = command_channel_tx.send(action);
                             break;
                         }
                         _ => {}
