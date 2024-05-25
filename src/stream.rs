@@ -7,16 +7,15 @@ use futures_util::StreamExt;
 use reqwest::{Client, Url};
 use stream_download::http::ClientResponse;
 use tokio::sync::broadcast::{Receiver, Sender};
+use tracing::{debug, Level, span};
 
 use crate::{Action, MetaData};
 use crate::source::{PositionReached, SourceHandle};
 use crate::storage::{StorageProvider, StorageWriter};
 
 pub struct StreamDownload<P: StorageProvider> {
-    pub(crate) reader: P::Reader,
+    reader: P::Reader,
     handle: SourceHandle,
-    prefetch_bytes: usize,
-    write_position: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +45,9 @@ impl<P: StorageProvider> StreamDownload<P> {
     // Result<Self, Box<dyn Error>>
     pub async fn new(working_url: &str, storage_provider: P, mut command_channel_rx: Receiver<Action>,
                      meta_channel_tx: Sender<MetaData>) -> anyhow::Result<Self> {
+        let span = span!(Level::DEBUG, "StreamDownload");
+        let _enter = span.enter();
+
         let (reader, mut writer) = storage_provider.into_reader_writer(None)?;
 
         let client = Client::new();
@@ -61,13 +63,10 @@ impl<P: StorageProvider> StreamDownload<P> {
         } else {
             return Err(StreamError::new("wrong content type").into());
         }
-        // for header in headers.iter() {
-        //     if header.0.to_string().starts_with("icy") { println!("{} {}", header.0, header.1.to_str().unwrap_or_default().parse::<String>().unwrap_or_default()) }
-        // }
 
-        // for header in headers.iter().filter(|header| header.0.as_str().starts_with("icy")).into_iter() {
-        //     println!("{} {}", header.0, header.1.to_str().unwrap_or_default().parse::<String>().unwrap_or_default())
-        // }
+        for header in headers.iter().filter(|header| header.0.as_str().starts_with("icy")).into_iter() {
+            debug!("{} {}", header.0, header.1.to_str().unwrap_or_default().parse::<String>().unwrap_or_default())
+        }
 
         let meta_interval: usize = if let Some(header_value) = headers.get("icy-metaint") {
             header_value.to_str().unwrap_or_default().parse().unwrap_or_default()
@@ -81,10 +80,12 @@ impl<P: StorageProvider> StreamDownload<P> {
             128
         };
 
+        meta_channel_tx.send(MetaData::with_bitrate(bitrate as u16)).unwrap();
+
         // buffer 5 seconds of audio
         // bitrate (in kilobits) / bits per byte * bytes per kilobyte * 5 seconds
         let prefetch_bytes = bitrate / 8 * 1024 * 5;
-        // println!("prefetch bytes={prefetch_bytes}");
+        debug!("prefetch_bytes = {}", prefetch_bytes);
 
         let mut source = Source::new(writer, prefetch_bytes as u64);
         let handle = source.source_handle();
@@ -100,7 +101,6 @@ impl<P: StorageProvider> StreamDownload<P> {
                 if let Ok(chunk) = stream.next().await.transpose() {
                     if !command_channel_rx.is_empty() {
                         if let Ok(action) = command_channel_rx.recv().await {
-                            // println!("received {:?}", command);
                             match action {
                                 _ => { break 'outer; }
                             }
@@ -129,7 +129,7 @@ impl<P: StorageProvider> StreamDownload<P> {
                                             let stream_title_substring = &metadata_string[left_index..];
                                             if let Some(right_index) = stream_title_substring.find('\'') {
                                                 let trimmed_song_title = &stream_title_substring[..right_index];
-                                                meta_channel_tx.send(MetaData::new(trimmed_song_title)).unwrap();
+                                                meta_channel_tx.send(MetaData::with_title(trimmed_song_title)).unwrap();
                                             }
                                         }
                                     }
@@ -154,8 +154,6 @@ impl<P: StorageProvider> StreamDownload<P> {
         Ok(Self {
             reader,
             handle,
-            prefetch_bytes,
-            write_position: 0u64,
         })
     }
 }

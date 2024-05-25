@@ -12,6 +12,7 @@ pub struct SpyDecoder<R> where R: Read + Seek
     stats_collect: bool,
 }
 
+#[allow(dead_code)]
 impl<R> SpyDecoder<R>
     where
         R: Read + Seek + Send + Sync + 'static,

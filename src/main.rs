@@ -1,16 +1,22 @@
 extern crate core;
 
+use std::{env, time};
 use std::cmp::{min, PartialEq};
 use std::error::Error;
 use std::fmt::{Debug, Display};
 use std::io::{Read, Seek, stdout, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crossterm::{event, ExecutableCommand};
+use crossterm::event;
 use crossterm::event::Event::Key;
 use crossterm::event::KeyCode;
+use crossterm::ExecutableCommand;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use diesel::associations::HasTable;
+use diesel::prelude::*;
+use dotenvy::dotenv;
 use futures_util::TryStreamExt;
 use rand::Rng;
 use ratatui::{Frame, Terminal};
@@ -24,9 +30,12 @@ use symphonia::core::conv::IntoSample;
 use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::{Receiver, Sender};
+use tracing::{debug, info, Level, span};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::bounded::BoundedStorageProvider;
 use crate::memory::MemoryStorageProvider;
+use crate::model::{History, NewHistory};
 use crate::stream::StreamDownload;
 
 mod memory;
@@ -35,6 +44,8 @@ mod stream;
 mod bounded;
 mod spy_decoder;
 mod storage;
+mod schema;
+mod model;
 
 const MEMORY_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -102,15 +113,56 @@ impl RadioStationList {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MetaData {
     title: String,
+    bitrate: u16,
+    channels: u16,
+    sample_rate: u32,
+}
+
+impl Default for MetaData {
+    fn default() -> Self {
+        MetaData { title: "".to_string(), bitrate: 0, channels: 0, sample_rate: 0 }
+    }
 }
 
 impl MetaData {
-    fn new(title: &str) -> Self {
-        MetaData { title: title.to_string() }
+    fn with_title(title: &str) -> Self {
+        MetaData { title: title.to_string(), ..Self::default() }
+    }
+
+    fn with_decoder_config(channels: u16, sample_rate: u32) -> Self {
+        MetaData { channels, sample_rate, ..Self::default() }
+    }
+
+    fn with_bitrate(bitrate: u16) -> Self {
+        MetaData { bitrate, ..Self::default() }
     }
 
     fn title(&self) -> &str {
         self.title.as_str()
+    }
+
+    fn merge(&mut self, meta: &MetaData) -> MetaData {
+        let mut merged_meta = self.clone();
+        if self.title.is_empty() && !meta.title.is_empty() {
+            merged_meta.title = meta.title().to_string();
+        }
+        if self.bitrate == 0 && meta.bitrate != 0 {
+            merged_meta.bitrate = meta.bitrate;
+        }
+        if self.channels == 0 && meta.channels != 0 {
+            merged_meta.channels = meta.channels;
+        }
+        if self.sample_rate == 0 && meta.sample_rate != 0 {
+            merged_meta.sample_rate = meta.sample_rate;
+        }
+        merged_meta
+    }
+
+    fn decoder_config(&self) -> String {
+        if self.channels != 0 {
+            return format!("{}/{}/{}", self.sample_rate, self.channels, self.bitrate);
+        }
+        "".to_string()
     }
 }
 
@@ -129,16 +181,25 @@ impl Action {
 }
 
 async fn play_station(station: RadioStation, sink: Arc<Sink>, command_channel_rx: Receiver<Action>, meta_channel_tx: Sender<MetaData>) -> anyhow::Result<()> {
+    let span = span!(Level::DEBUG, "play_station");
+    let _enter = span.enter();
+
+    debug!("started");
     let storage_provider = BoundedStorageProvider::new(
         MemoryStorageProvider::new(),
         NonZeroUsize::new(MEMORY_BUFFER_SIZE).unwrap());
-    let stream_download = StreamDownload::new(station.url(), storage_provider, command_channel_rx, meta_channel_tx).await?;
+    let stream_download = StreamDownload::new(station.url(), storage_provider, command_channel_rx, meta_channel_tx.clone()).await?;
 
+    debug!("wait for decoder");
     let handle = tokio::task::spawn_blocking(move || {
         let decoder = Decoder::new(stream_download)?;
+        meta_channel_tx.send(MetaData::with_decoder_config(decoder.channels(), decoder.sample_rate())).unwrap();
         sink.append(decoder);
+        debug!("decoder created");
         Ok::<(), DecoderError>(())
     });
+    debug!("done");
+
     match handle.await {
         Ok(Ok(())) => { Ok(()) }
         Ok(Err(e)) => { Err(anyhow::anyhow!(e)) }
@@ -215,12 +276,17 @@ impl App {
         None
     }
 
-    pub fn set_current_meta(&mut self, meta: MetaData) {
-        self.current_meta = Some(meta.clone())
+    pub fn set_current_meta(&mut self, meta: &MetaData) {
+        let merged_meta = self.current_meta().unwrap().merge(meta);
+        self.current_meta = Some(merged_meta);
     }
 
     pub fn current_meta(&self) -> Option<MetaData> {
         self.current_meta.clone()
+    }
+
+    pub fn clear_current_meta(&mut self) {
+        self.current_meta = Some(MetaData::default());
     }
     pub fn set_current_status(&mut self, status: Option<String>) {
         self.current_status = status;
@@ -263,7 +329,7 @@ fn draw_now_playing(
 {
     if app.current_meta().is_some() {
         let cm = app.current_meta().unwrap();
-        let lines = Text::from(cm.title());
+        let lines = Text::from(format!("{}\n{}", cm.title(), cm.decoder_config()));
         let now_playing = Paragraph::new(lines).block(
             Block::new().borders(Borders::ALL).title(title));
         f.render_widget(now_playing, layout_chunk);
@@ -293,12 +359,72 @@ fn draw_status(
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let (command_channel_tx, mut command_channel_rx) = broadcast::channel::<Action>(1);
-    let (meta_channel_tx, mut meta_channel_rx) = broadcast::channel::<MetaData>(1);
+pub fn establish_connection() -> anyhow::Result<SqliteConnection> {
+    dotenv().ok();
 
-    let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    Ok(SqliteConnection::establish(&database_url)?)
+}
+
+pub fn add_history(radio_station: RadioStation, meta_data: MetaData) -> anyhow::Result<()> {
+    use crate::schema::history;
+
+    let mut connection = establish_connection()?;
+    let datetime = chrono::prelude::DateTime::<chrono::Local>::from(SystemTime::now());
+    let timestamp_str = datetime.format("%a, %e %b %Y %H:%M").to_string();
+    let new_history = NewHistory { station: radio_station.title(), title: meta_data.title(), timestamp: timestamp_str.as_str() };
+
+    let find_history_items = find_history(meta_data.title(), timestamp_str.as_str())?;
+    debug!("find history for {} {:?}", meta_data.title(), find_history_items);
+    if find_history_items.is_empty() {
+        debug!("add history entry = {:?}", new_history);
+
+        let _ = diesel::insert_into(history::table)
+            .values(&new_history)
+            .execute(&mut connection);
+    }
+
+    Ok(())
+}
+
+pub fn get_history() -> anyhow::Result<Vec<History>> {
+    use self::schema::history::dsl::*;
+
+    let mut connection = establish_connection()?;
+    Ok(history
+        .select(History::as_select())
+        .load::<History>(&mut connection)?)
+}
+
+pub fn find_history(meta_title: &str, timestamp_str: &str) -> anyhow::Result<Vec<History>> {
+    use self::schema::history::dsl::*;
+
+    let mut connection = establish_connection()?;
+    Ok(history
+        .filter(title.eq(meta_title))
+        .select(History::as_select())
+        .load::<History>(&mut connection)?)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // let file_appender = tracing_appender::rolling::hourly("logs", "prefix.log");
+    // let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, _guard) = tracing_appender::non_blocking(std::io::stderr());
+    tracing_subscriber::fmt()
+        .with_max_level(Level::DEBUG)
+        .with_writer(non_blocking)
+        .init();
+
+    // tracing_subscriber::fmt()
+    //     .with_max_level(Level::DEBUG)
+    //     .init();
+
+    debug!("main");
+    let (command_channel_tx, mut command_channel_rx) = broadcast::channel::<Action>(1);
+    let (meta_channel_tx, mut meta_channel_rx) = broadcast::channel::<MetaData>(3);
+
+    let (_stream, handle) = rodio::OutputStream::try_default()?;
     let sink = Arc::new(rodio::Sink::try_new(&handle).unwrap());
 
     let mut app = App::init();
@@ -310,9 +436,16 @@ async fn main() {
     stdout().execute(EnterAlternateScreen).unwrap();
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).unwrap();
 
+    for history in get_history().unwrap() {
+        debug!("{:?}", history);
+    }
+
     loop {
         if let Ok(meta_data) = meta_channel_rx.try_recv() {
-            app.set_current_meta(meta_data);
+            app.set_current_meta(&meta_data);
+            if !meta_data.title.is_empty() {
+                let _ = add_history(app.current_station().unwrap(), meta_data);
+            }
         }
         terminal.draw(|frame| {
             let main_layout = Layout::new(
@@ -347,6 +480,7 @@ async fn main() {
                             // stop play task
                             command_sink.stop();
                             // start new
+                            app.clear_current_meta();
                             match play_station(app.current_station().unwrap(), sink.clone(), command_channel_tx.subscribe(), meta_channel_tx.clone()).await {
                                 Ok(_) => {
                                     app.set_current_status(None);
@@ -378,4 +512,5 @@ async fn main() {
 
     disable_raw_mode().unwrap();
     stdout().execute(LeaveAlternateScreen).unwrap();
+    Ok(())
 }
