@@ -16,5 +16,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install system libs
+      run: sudo apt-get install -y libasound2-dev portaudio19-dev build-essential libpulse-dev libdbus-1-dev 
     - name: Build
       run: cargo build --verbose --release
